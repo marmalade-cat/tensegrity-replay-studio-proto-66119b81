@@ -1,0 +1,152 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Replay Studio — Prototype</title>
+<style>
+body{font-family:Arial;margin:12px;color:#222}
+#controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+textarea{width:100%;height:80px;font-family:monospace}
+canvas{border:1px solid #ccc;background:#f8f8f8}
+#plots{display:flex;gap:8px}
+.plot{flex:1}
+</style>
+</head>
+<body>
+<h3>Tensegrity Replay Studio — Prototype</h3>
+<div id="controls">
+<input type="file" id="file" />
+<button id="loadExample">Load example</button>
+<button id="exportJSON">Export normalized JSON</button>
+<span id="status"></span>
+</div>
+<div style="display:flex;gap:12px">
+<div style="flex:1">
+<label>Raw input (CSV or JSON):</label>
+<textarea id="raw" placeholder='Paste CSV or JSON here'></textarea>
+</div>
+<div style="width:420px">
+<label>Validation & Info</label>
+<pre id="info" style="height:120px;overflow:auto;background:#fff;border:1px solid #ddd;padding:6px"></pre>
+</div>
+</div>
+<div id="plots">
+<div class="plot">
+<label>Time-series (X of module 0)</label>
+<canvas id="ts" width="600" height="150"></canvas>
+</div>
+<div style="width:320px">
+<label>3D Wireframe</label>
+<canvas id="gl" width="320" height="240"></canvas>
+</div>
+</div>
+<script>
+// Minimal prototype parser + visualizer
+const status = id('status'), raw = id('raw'), info = id('info');
+const tsCanvas = id('ts'), glCanvas = id('gl');
+let replay = null; // normalized {times:[], modules:[{name,poses:[{x,y,z,qx,qy,qz,qw}] } ] }
+
+id('file').addEventListener('change', e=>{
+  const f = e.target.files[0]; if(!f) return;
+  const r = new FileReader(); r.onload = ()=>{ raw.value = r.result; processInput(); }; r.readAsText(f);
+});
+id('loadExample').onclick = ()=>{ raw.value = exampleCSV(); processInput(); };
+id('exportJSON').onclick = ()=>{ if(!replay){ alert('No valid replay'); return;} const blob = new Blob([JSON.stringify(replay,null,2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='replay.json'; document.body.appendChild(a); a.click(); a.remove(); };
+raw.oninput = debounce(processInput,300);
+
+function processInput(){
+  const s = raw.value.trim(); if(!s){ info.textContent='No input'; replay=null; drawEmpty(); return; }
+  let parsed = tryParseJSON(s);
+  if(!parsed){ parsed = tryParseCSV(s); }
+  if(!parsed){ info.textContent='Failed to parse input as JSON or CSV.'; replay=null; drawEmpty(); return; }
+  const valid = validateAndNormalize(parsed);
+  if(valid.error){ info.textContent = 'Validation error:\n'+valid.error; replay=null; drawEmpty(); return; }
+  replay = valid.replay; info.textContent = renderInfo(replay);
+  drawTimeSeries(replay); draw3D(replay);
+}
+
+function tryParseJSON(s){ try{ return JSON.parse(s); }catch(e){return null;} }
+
+// Accept CSV where columns: time,module,x,y,z,qx,qy,qz,qw
+function tryParseCSV(s){ const lines = s.split(/\r?\n/).map(l=>l.trim()).filter(Boolean); if(lines.length<2) return null;
+  const header = lines[0].split(/[ ,;\t]+/).map(h=>h.toLowerCase()); const cols = header.reduce((m,h,i)=>(m[h]=i,m),{});
+  const required = ['time','module','x','y','z']; if(!required.every(r=>r in cols)) return null;
+  const rows = lines.slice(1).map(l=>l.split(/[ ,;\t]+/));
+  const obj = {};
+  for(const r of rows){ const t=parseFloat(r[cols['time']]); const m = r[cols['module']]; if(isNaN(t) || m===undefined) continue;
+    const x = parseFloat(r[cols['x']]), y=parseFloat(r[cols['y']]), z=parseFloat(r[cols['z']]);
+    const qx = cols['qx']!==undefined?parseFloat(r[cols['qx']]):0; const qy=cols['qy']!==undefined?parseFloat(r[cols['qy']]):0; const qz=cols['qz']!==undefined?parseFloat(r[cols['qz']]):0; const qw=cols['qw']!==undefined?parseFloat(r[cols['qw']]):1;
+    obj[m]=obj[m]||[]; obj[m].push({t,x,y,z,qx,qy,qz,qw});
+  }
+  return {byModule:obj};
+}
+
+function validateAndNormalize(parsed){
+  // If parsed is already normalized form, accept
+  if(parsed.times && parsed.modules) return {replay:parsed};
+  // If parsed.byModule
+  const byModule = parsed.byModule || parsed.modules;
+  if(!byModule) return {error:'Unrecognized structure.'};
+  // collect module names
+  const names = Object.keys(byModule);
+  if(names.length===0) return {error:'No modules'};
+  // collect times per module and check consistency
+  const timesSet = new Set(); let commonCount = null;
+  const modules = [];
+  for(const name of names){ const arr = byModule[name]; if(!Array.isArray(arr)) return {error:'Module data must be array'};
+    arr.sort((a,b)=>a.t-b.t);
+    if(!arr.every((v,i,aa)=>i===0||v.t>aa[i-1].t)){} // monotonic check done below
+    const times = arr.map(p=>p.t);
+    if(times.some(isNaN)) return {error:'Bad time values for '+name};
+    if(commonCount===null) commonCount = times.length; else if(times.length!==commonCount) return {error:'Inconsistent sample count across modules.'};
+    times.forEach(t=>timesSet.add(t));
+    modules.push({name,poses:arr.map(p=>({x:p.x,y:p.y,z:p.z,qx:p.qx||0,qy:p.qy||0,qz:p.qz||0,qw:(p.qw===undefined?1:p.qw)}))});
+  }
+  const times = Array.from(timesSet).sort((a,b)=>a-b);
+  // verify monotonic
+  if(times.length!==commonCount) return {error:'Times mismatch between modules'};
+  for(let i=1;i<times.length;i++) if(!(times[i]>times[i-1])) return {error:'Times not strictly increasing'};
+  return {replay:{times,modules}};
+}
+
+function renderInfo(replay){
+  return 'Modules: '+replay.modules.map(m=>m.name).join(', ') + '\n' + 'Samples: '+replay.times.length + '\n' + 'Duration: '+(replay.times[replay.times.length-1]-replay.times[0]).toFixed(3)+'s';
+}
+
+// Simple 2D plot of X of module 0
+function drawTimeSeries(replay){ const ctx = tsCanvas.getContext('2d'); ctx.clearRect(0,0,tsCanvas.width,tsCanvas.height);
+  const w=tsCanvas.width,h=tsCanvas.height; const m0 = replay.modules[0]; if(!m0){ ctx.fillText('No data',10,10); return; }
+  const xs = m0.poses.map(p=>p.x); const min=Math.min(...xs), max=Math.max(...xs); const pad=(max-min)||1;
+  ctx.beginPath(); for(let i=0;i<xs.length;i++){ const x = i/(xs.length-1)*(w-10)+5; const y = h-5-((xs[i]-min)/pad)*(h-10); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); } ctx.strokeStyle='#0077aa'; ctx.stroke();
+}
+
+// Minimal WebGL wireframe: render points and edges between modules (simple complete graph)
+function draw3D(replay){ const gl = glCanvas.getContext('webgl')||glCanvas.getContext('experimental-webgl'); if(!gl){ glCanvas.getContext('2d').fillText('WebGL unavailable',10,20); return; }
+  // Build simple perspective projection and draw points as colored squares in 3D projected to 2D
+  const ctx2 = glCanvas.getContext('2d'); // easier: use 2D for wireframe proto
+  const g = ctx2; g.clearRect(0,0,glCanvas.width,glCanvas.height);
+  const cx = glCanvas.width/2, cy=glCanvas.height/2, scale=40;
+  let tIndex=0;
+  function frame(){ g.clearRect(0,0,glCanvas.width,glCanvas.height);
+    const N = replay.modules.length; const poses = replay.modules.map(m=>m.poses[tIndex]);
+    // Draw edges
+    g.strokeStyle='#444';
+    for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){ const a=proj(poses[i]), b=proj(poses[j]); g.beginPath(); g.moveTo(a.x,a.y); g.lineTo(b.x,b.y); g.stroke(); }
+    // Draw nodes
+    for(let i=0;i<N;i++){ const p=proj(poses[i]); g.fillStyle=(i===0?'#c55':'#55a'); g.fillRect(p.x-4,p.y-4,8,8); }
+    tIndex = (tIndex+1) % replay.times.length; requestAnimationFrame(frame);
+  }
+  function proj(p){ const z = (p.z+2.5) || 0.0001; return {x:cx + p.x*scale/(z+2), y:cy - p.y*scale/(z+2)}; }
+  cancelAnimationFrame(window._protoAnim||0); window._protoAnim = requestAnimationFrame(frame);
+}
+
+function drawEmpty(){ const ctx=tsCanvas.getContext('2d'); ctx.clearRect(0,0,tsCanvas.width,tsCanvas.height); const g=glCanvas.getContext('2d'); if(g){ g.clearRect(0,0,glCanvas.width,glCanvas.height); g.fillText('No data',10,20);} }
+
+// Helpers
+function id(s){ return document.getElementById(s); }
+function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
+
+function exampleCSV(){ return 'time,module,x,y,z\n0.0,alpha,0,0,0\n0.0,beta,1,0,0\n0.5,alpha,0.1,0.2,0\n0.5,beta,0.9,-0.1,0\n1.0,alpha,0.2,0.3,0\n1.0,beta,0.8,-0.2,0\n'; }
+</script>
+</body>
+</html>
